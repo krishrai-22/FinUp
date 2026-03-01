@@ -1,6 +1,7 @@
 const FinancialData = require("../models/FinancialData");
 const { calculateRisk } = require("../utils/riskEngine");
 const { projectSavings } = require("../utils/projectionEngine");
+const { getAISuggestions } = require("../utils/geminiService");
 
 /* ─────────────────────────────────────────────
    POST /api/calculate-risk
@@ -41,41 +42,32 @@ const calculateRiskHandler = async (req, res) => {
             });
         }
 
-        // ── Risk calculation ──
-        const { riskScore, category, breakdown, suggestions } = calculateRisk({
-            income,
-            expenses,
-            emi,
-            creditUtilization,
-            savings,
+        // ── Rule-based risk calculation ──
+        const { riskScore, category, breakdown, suggestions: ruleSuggestions } = calculateRisk({
+            income, expenses, emi, creditUtilization, savings,
         });
 
         // ── 3-month savings projection ──
         const projection = projectSavings(savings, income, expenses, emi, 3);
 
+        // ── Gemini AI suggestions (with fallback) ──
+        const aiSuggestions = await getAISuggestions(
+            { memberName, income, expenses, emi, creditUtilization, savings },
+            riskScore, category, breakdown, projection
+        );
+        const suggestions = aiSuggestions || ruleSuggestions;
+
         // ── Persist to DB ──
         const record = await FinancialData.create({
             userId: req.user ? req.user._id : null,
-            memberName,
-            income,
-            expenses,
-            emi,
-            creditUtilization,
-            savings,
-            riskScore,
-            category,
-            breakdown,
-            suggestions,
-            projection,
+            memberName, income, expenses, emi, creditUtilization, savings,
+            riskScore, category, breakdown, suggestions, projection,
         });
 
         res.status(201).json({
             success: true,
-            riskScore,
-            category,
-            breakdown,
-            suggestions,
-            projection,
+            riskScore, category, breakdown, suggestions, projection,
+            aiPowered: !!aiSuggestions,
             record,
         });
     } catch (err) {
@@ -94,73 +86,52 @@ const calculateRiskHandler = async (req, res) => {
 const simulateHandler = async (req, res) => {
     try {
         const {
-            memberName,
-            income,
-            expenses,
-            emi,
-            creditUtilization,
-            savings,
-            adjustExpensePercent = 0,
-            adjustIncomePercent = 0,
-            adjustEMI = 0,
+            memberName, income, expenses, emi, creditUtilization, savings,
+            adjustExpensePercent = 0, adjustIncomePercent = 0, adjustEMI = 0,
             save = false,
         } = req.body;
 
         if (!income || income <= 0) {
-            return res.status(400).json({
-                success: false,
-                message: "Income must be a positive number.",
-            });
+            return res.status(400).json({ success: false, message: "Income must be a positive number." });
         }
 
         // Apply adjustments
-        const adjIncome = income * (1 + adjustIncomePercent / 100);
+        const adjIncome   = income   * (1 + adjustIncomePercent  / 100);
         const adjExpenses = expenses * (1 + adjustExpensePercent / 100);
-        const adjEMI = emi + adjustEMI;
+        const adjEMI      = emi + adjustEMI;
 
-        const { riskScore, category, breakdown, suggestions } = calculateRisk({
-            income: adjIncome,
-            expenses: adjExpenses,
-            emi: adjEMI,
-            creditUtilization,
-            savings,
+        const { riskScore, category, breakdown, suggestions: ruleSuggestions } = calculateRisk({
+            income: adjIncome, expenses: adjExpenses, emi: adjEMI, creditUtilization, savings,
         });
 
         const projection = projectSavings(savings, adjIncome, adjExpenses, adjEMI, 3);
+
+        // ── Gemini AI suggestions (with fallback) ──
+        const aiSuggestions = await getAISuggestions(
+            { memberName, income: adjIncome, expenses: adjExpenses, emi: adjEMI, creditUtilization, savings },
+            riskScore, category, breakdown, projection
+        );
+        const suggestions = aiSuggestions || ruleSuggestions;
 
         let record = null;
         if (save) {
             record = await FinancialData.create({
                 userId: req.user ? req.user._id : null,
                 memberName: memberName || "Simulation",
-                income: adjIncome,
-                expenses: adjExpenses,
-                emi: adjEMI,
-                creditUtilization,
-                savings,
-                riskScore,
-                category,
-                breakdown,
-                suggestions,
-                projection,
+                income: adjIncome, expenses: adjExpenses, emi: adjEMI,
+                creditUtilization, savings, riskScore, category, breakdown, suggestions, projection,
             });
         }
 
         res.status(200).json({
             success: true,
             adjusted: { income: adjIncome, expenses: adjExpenses, emi: adjEMI },
-            riskScore,
-            category,
-            breakdown,
-            suggestions,
-            projection,
+            riskScore, category, breakdown, suggestions, projection,
+            aiPowered: !!aiSuggestions,
             ...(record && { record }),
         });
     } catch (err) {
-        res.status(500).json({
-            success: false,
-            message: err.message || "Server error during simulation.",
-        });
+        res.status(500).json({ success: false, message: err.message || "Server error during simulation." });
     }
 };
 
